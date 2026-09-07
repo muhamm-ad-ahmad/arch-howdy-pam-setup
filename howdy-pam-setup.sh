@@ -1,51 +1,56 @@
-#!/usr/bin/env bash
+#!/bin/bash
+# ===========================================================================
+# howdy-pam-setup.sh — Automated Howdy PAM setup for Arch Linux & Omarchy
 #
-# howdy-pam-setup.sh
+# Works on:
+#   - Arch Linux / CachyOS (standard sudo + system-auth)
+#   - Omarchy (sudo + system-auth + Quickshell lockscreen with "press Enter to scan")
 #
-# Idempotently wires Howdy (pam_howdy.so) into PAM on Arch-based systems
-# (Arch, CachyOS, Manjaro, EndeavourOS, etc).
-#
-# What it does:
-#   1. Locates pam_howdy.so on disk (does not assume a fixed path).
-#   2. Backs up every PAM file it touches (once, with a timestamp).
-#   3. Inserts howdy into /etc/pam.d/sudo (top of file).
-#   4. Inserts howdy into /etc/pam.d/system-auth, placed right after
-#      "pam_faillock.so preauth" and before pam_unix.so, so it doesn't
-#      interfere with faillock bookkeeping. This single file chains
-#      into sudo, su, login, KDE's kscreenlocker (kde -> system-local-login
-#      -> system-login -> system-auth) and polkit-1 (-> system-auth)
-#      on most Arch/CachyOS setups.
-#   5. Skips any file that already has a howdy line (safe to re-run).
-#   6. Verifies sudo still works via a syntax/logic sanity check before
-#      declaring success, and prints manual test instructions.
-#
-# It deliberately does NOT touch kwallet — kwallet needs an actual
-# password to derive its decryption key, not a pass/fail auth module,
-# so it can't be wired through howdy the same way. See the printed
-# notes at the end of the script.
+# Features:
+#   - Auto-detects pam_howdy.so location
+#   - Detects Omarchy desktop and configures its custom Quickshell lock screen
+#   - Patches Omarchy lock screen to trigger face scan when pressing Enter
+#   - Fully idempotent (safe to re-run anytime)
+#   - Creates timestamped backups of all modified files
+#   - Full --undo and --dry-run support
 #
 # Usage:
-#   sudo ./howdy-pam-setup.sh              # apply
-#   sudo ./howdy-pam-setup.sh --dry-run    # show what would change
-#   sudo ./howdy-pam-setup.sh --undo       # restore latest backups
-#
+#   sudo ./howdy-pam-setup.sh              # Apply setup
+#   sudo ./howdy-pam-setup.sh --dry-run    # Preview changes without modifying
+#   sudo ./howdy-pam-setup.sh --undo       # Restore latest backups
+# ===========================================================================
+
 set -euo pipefail
 
 DRY_RUN=0
 UNDO=0
+
 for arg in "${@:-}"; do
   case "$arg" in
     --dry-run) DRY_RUN=1 ;;
-    --undo) UNDO=1 ;;
+    --undo)    UNDO=1 ;;
     -h|--help)
-      echo "Usage: sudo $0 [--dry-run|--undo]"
+      cat <<'USAGE'
+howdy-pam-setup.sh - Automated Howdy PAM setup for Arch Linux & Omarchy
+
+Usage:
+  sudo ./howdy-pam-setup.sh              Apply configuration
+  sudo ./howdy-pam-setup.sh --dry-run    Preview changes without applying
+  sudo ./howdy-pam-setup.sh --undo       Revert to the latest backups
+  sudo ./howdy-pam-setup.sh --help       Show this help message
+USAGE
       exit 0
+      ;;
+    *)
+      echo "Unknown option: $arg" >&2
+      echo "Run 'sudo $0 --help' for usage." >&2
+      exit 1
       ;;
   esac
 done
 
 if [[ $EUID -ne 0 ]]; then
-  echo "This script must be run as root (sudo $0)" >&2
+  echo "Error: This script must be run as root (e.g. sudo $0)" >&2
   exit 1
 fi
 
@@ -54,25 +59,70 @@ PAM_DIR="/etc/pam.d"
 SUDO_FILE="$PAM_DIR/sudo"
 SYSAUTH_FILE="$PAM_DIR/system-auth"
 
-log()  { echo -e "[*] $*"; }
-warn() { echo -e "[!] $*" >&2; }
-ok()   { echo -e "[✓] $*"; }
+# Omarchy specific paths
+OMARCHY_PAM_FILE="$PAM_DIR/omarchy-lock-password"
+OMARCHY_APPLY_LOCK="/usr/bin/omarchy-apply-lock"
+LOCKVIEW_QML="/usr/share/omarchy/shell/plugins/lock/LockView.qml"
+SERVICE_QML="/usr/share/omarchy/shell/plugins/lock/Service.qml"
+
+ALL_MANAGED_FILES=(
+  "$SUDO_FILE"
+  "$SYSAUTH_FILE"
+  "$OMARCHY_PAM_FILE"
+  "$OMARCHY_APPLY_LOCK"
+  "$LOCKVIEW_QML"
+  "$SERVICE_QML"
+)
+
+# Terminal formatting
+log()  { echo -e "\e[34m[*]\e[0m $*"; }
+warn() { echo -e "\e[33m[!]\e[0m $*" >&2; }
+ok()   { echo -e "\e[32m[✓]\e[0m $*"; }
+err()  { echo -e "\e[31m[✗]\e[0m $*" >&2; }
+
+# Helper: backup file once per run
+backup_file() {
+  local f="$1"
+  if [[ $DRY_RUN -eq 0 ]]; then
+    cp -p "$f" "${f}.bak.${TS}"
+    ok "Backed up $(basename "$f") -> ${f}.bak.${TS}"
+  else
+    log "[dry-run] Would back up $f -> ${f}.bak.${TS}"
+  fi
+}
 
 # ---------------------------------------------------------------------------
-# --undo mode: restore the most recent backup of each managed file
+# --undo mode: restore latest backup for all managed files
 # ---------------------------------------------------------------------------
 if [[ $UNDO -eq 1 ]]; then
-  for f in "$SUDO_FILE" "$SYSAUTH_FILE"; do
+  log "Reverting changes from latest backups..."
+  restored_any=0
+  for f in "${ALL_MANAGED_FILES[@]}"; do
     latest="$(ls -1t "${f}.bak."* 2>/dev/null | head -n1 || true)"
     if [[ -n "$latest" ]]; then
       cp -v "$latest" "$f"
       ok "Restored $f from $latest"
-    else
-      warn "No backup found for $f, skipping"
+      restored_any=1
     fi
   done
-  echo
-  ok "Undo complete. Test sudo now: sudo -k && sudo whoami"
+
+  if [[ $restored_any -eq 0 ]]; then
+    warn "No backup files found to restore."
+  else
+    echo
+    ok "Undo complete."
+    # If Omarchy shell is running, reload it
+    if command -v omarchy-restart-shell >/dev/null 2>&1; then
+      log "Restarting Omarchy shell to reload restored files..."
+      # Run as the actual user if running through sudo
+      target_user="${SUDO_USER:-$USER}"
+      if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+        su - "$target_user" -c "omarchy-restart-shell" || true
+      else
+        omarchy-restart-shell || true
+      fi
+    fi
+  fi
   exit 0
 fi
 
@@ -83,121 +133,179 @@ log "Locating pam_howdy.so..."
 HOWDY_SO="$(find /usr/lib -xdev -name 'pam_howdy.so' 2>/dev/null | grep -v '/.snapshots/' | head -n1 || true)"
 
 if [[ -z "$HOWDY_SO" ]]; then
-  warn "Could not find pam_howdy.so under /usr/lib. Is howdy-next installed?"
-  warn "Try: pacman -Qs howdy   (or check your AUR package name)"
+  err "Could not find pam_howdy.so under /usr/lib."
+  warn "Please ensure howdy or howdy-next is installed (e.g. yay -S howdy-next)."
   exit 1
 fi
-ok "Found: $HOWDY_SO"
+ok "Found Howdy PAM module: $HOWDY_SO"
 
 HOWDY_LINE="auth       sufficient                  ${HOWDY_SO}"
 
 # ---------------------------------------------------------------------------
-# helper: backup a file once per run
+# 2. Configure /etc/pam.d/sudo
 # ---------------------------------------------------------------------------
-backup_file() {
-  local f="$1"
-  if [[ $DRY_RUN -eq 0 ]]; then
-    cp -p "$f" "${f}.bak.${TS}"
-    ok "Backed up $f -> ${f}.bak.${TS}"
-  else
-    log "[dry-run] Would back up $f -> ${f}.bak.${TS}"
-  fi
-}
-
-# ---------------------------------------------------------------------------
-# 2. /etc/pam.d/sudo — insert howdy as the very first auth line
-# ---------------------------------------------------------------------------
-log "Checking $SUDO_FILE ..."
+log "Checking $SUDO_FILE..."
 if [[ ! -f "$SUDO_FILE" ]]; then
   warn "$SUDO_FILE not found, skipping"
 elif grep -q "pam_howdy.so" "$SUDO_FILE"; then
-  ok "$SUDO_FILE already has howdy, skipping"
+  ok "$SUDO_FILE already configured with Howdy, skipping"
 else
   if [[ $DRY_RUN -eq 1 ]]; then
-    log "[dry-run] Would prepend to $SUDO_FILE:"
-    echo "    $HOWDY_LINE"
+    log "[dry-run] Would prepend to $SUDO_FILE: $HOWDY_LINE"
   else
     backup_file "$SUDO_FILE"
     sed -i "1i ${HOWDY_LINE}" "$SUDO_FILE"
-    ok "Inserted howdy into $SUDO_FILE"
+    ok "Configured $SUDO_FILE"
   fi
 fi
 
 # ---------------------------------------------------------------------------
-# 3. /etc/pam.d/system-auth — insert after "pam_faillock.so preauth"
-#    (covers sudo/su/login + anything that includes system-auth, e.g.
-#    KDE's kscreenlocker and polkit-1 on most Arch-based setups)
+# 3. Configure /etc/pam.d/system-auth
 # ---------------------------------------------------------------------------
-log "Checking $SYSAUTH_FILE ..."
+log "Checking $SYSAUTH_FILE..."
 if [[ ! -f "$SYSAUTH_FILE" ]]; then
   warn "$SYSAUTH_FILE not found, skipping"
 elif grep -q "pam_howdy.so" "$SYSAUTH_FILE"; then
-  ok "$SYSAUTH_FILE already has howdy, skipping"
+  ok "$SYSAUTH_FILE already configured with Howdy, skipping"
 elif ! grep -q "pam_faillock.so.*preauth" "$SYSAUTH_FILE"; then
-  warn "Couldn't find a 'pam_faillock.so preauth' line in $SYSAUTH_FILE"
-  warn "Skipping automatic insertion — your system-auth layout differs from"
-  warn "the standard Arch template. Insert this line manually, right before"
-  warn "the first pam_unix.so line under 'auth':"
-  echo "    $HOWDY_LINE"
+  warn "Could not find 'pam_faillock.so preauth' in $SYSAUTH_FILE. Skipping automatic insertion."
 else
   if [[ $DRY_RUN -eq 1 ]]; then
-    log "[dry-run] Would insert into $SYSAUTH_FILE after 'pam_faillock.so preauth':"
-    echo "    $HOWDY_LINE"
+    log "[dry-run] Would insert into $SYSAUTH_FILE after pam_faillock preauth: $HOWDY_LINE"
   else
     backup_file "$SYSAUTH_FILE"
     sed -i "/pam_faillock.so[[:space:]]*preauth/a ${HOWDY_LINE}" "$SYSAUTH_FILE"
-    ok "Inserted howdy into $SYSAUTH_FILE"
+    ok "Configured $SYSAUTH_FILE"
   fi
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Sanity check: make sure sudo's PAM file still parses sanely
-#    (basic check — real proof is the manual test below)
+# 4. Omarchy Lock Screen Configuration
 # ---------------------------------------------------------------------------
-if [[ $DRY_RUN -eq 0 ]]; then
-  if [[ -f "$SUDO_FILE" ]] && ! head -n1 "$SUDO_FILE" | grep -q "auth"; then
-    warn "First line of $SUDO_FILE doesn't look like an auth line — please check manually:"
-    head -n3 "$SUDO_FILE"
+is_omarchy=0
+if [[ -f "$OMARCHY_PAM_FILE" || -d "/usr/share/omarchy" ]]; then
+  is_omarchy=1
+fi
+
+if [[ $is_omarchy -eq 1 ]]; then
+  log "Omarchy desktop environment detected!"
+
+  # 4a. /etc/pam.d/omarchy-lock-password
+  log "Checking $OMARCHY_PAM_FILE..."
+  if [[ ! -f "$OMARCHY_PAM_FILE" ]]; then
+    warn "$OMARCHY_PAM_FILE not found"
+  elif grep -q "pam_howdy.so" "$OMARCHY_PAM_FILE"; then
+    ok "$OMARCHY_PAM_FILE already configured with Howdy, skipping"
+  elif ! grep -q "pam_faillock.so.*preauth" "$OMARCHY_PAM_FILE"; then
+    warn "Could not find 'pam_faillock.so preauth' in $OMARCHY_PAM_FILE. Prepending instead."
+    if [[ $DRY_RUN -eq 1 ]]; then
+      log "[dry-run] Would prepend to $OMARCHY_PAM_FILE: $HOWDY_LINE"
+    else
+      backup_file "$OMARCHY_PAM_FILE"
+      sed -i "2i ${HOWDY_LINE}" "$OMARCHY_PAM_FILE"
+      ok "Configured $OMARCHY_PAM_FILE"
+    fi
+  else
+    if [[ $DRY_RUN -eq 1 ]]; then
+      log "[dry-run] Would insert into $OMARCHY_PAM_FILE after pam_faillock preauth: $HOWDY_LINE"
+    else
+      backup_file "$OMARCHY_PAM_FILE"
+      sed -i "/pam_faillock.so[[:space:]]*preauth/a ${HOWDY_LINE}" "$OMARCHY_PAM_FILE"
+      ok "Configured $OMARCHY_PAM_FILE"
+    fi
+  fi
+
+  # 4b. /usr/bin/omarchy-apply-lock (to survive future lock generator runs)
+  if [[ -f "$OMARCHY_APPLY_LOCK" ]]; then
+    log "Checking $OMARCHY_APPLY_LOCK template..."
+    if grep -q "pam_howdy.so" "$OMARCHY_APPLY_LOCK"; then
+      ok "$OMARCHY_APPLY_LOCK already contains Howdy, skipping"
+    elif grep -q "pam_faillock.so.*preauth" "$OMARCHY_APPLY_LOCK"; then
+      if [[ $DRY_RUN -eq 1 ]]; then
+        log "[dry-run] Would insert Howdy into $OMARCHY_APPLY_LOCK template"
+      else
+        backup_file "$OMARCHY_APPLY_LOCK"
+        sed -i "/pam_faillock.so[[:space:]]*preauth/a ${HOWDY_LINE}" "$OMARCHY_APPLY_LOCK"
+        ok "Updated $OMARCHY_APPLY_LOCK template"
+      fi
+    fi
+  fi
+
+  # 4c. Patch LockView.qml to allow submitting empty password by pressing Enter
+  if [[ -f "$LOCKVIEW_QML" ]]; then
+    log "Checking $LOCKVIEW_QML..."
+    if ! grep -q "submitted.length > 0" "$LOCKVIEW_QML"; then
+      ok "$LOCKVIEW_QML already allows empty submission, skipping"
+    else
+      if [[ $DRY_RUN -eq 1 ]]; then
+        log "[dry-run] Would patch $LOCKVIEW_QML to submit on empty Enter"
+      else
+        backup_file "$LOCKVIEW_QML"
+        sed -i 's/if (submitted.length > 0) root.submitPassword(submitted)/root.submitPassword(submitted)/' "$LOCKVIEW_QML"
+        ok "Patched $LOCKVIEW_QML (Enter submits on empty field)"
+      fi
+    fi
+  fi
+
+  # 4d. Patch Service.qml to permit empty password for PAM face recognition
+  if [[ -f "$SERVICE_QML" ]]; then
+    log "Checking $SERVICE_QML..."
+    if ! grep -q "password.length === 0" "$SERVICE_QML"; then
+      ok "$SERVICE_QML already allows zero-length password auth, skipping"
+    else
+      if [[ $DRY_RUN -eq 1 ]]; then
+        log "[dry-run] Would patch $SERVICE_QML to allow zero-length password auth"
+      else
+        backup_file "$SERVICE_QML"
+        sed -i 's/if (!lockRequested || authenticatingPassword || password.length === 0) return/if (!lockRequested || authenticatingPassword) return/' "$SERVICE_QML"
+        ok "Patched $SERVICE_QML (permits face authentication with empty password)"
+      fi
+    fi
+  fi
+
+  # 4e. Reload Omarchy shell if running
+  if [[ $DRY_RUN -eq 0 ]] && command -v omarchy-restart-shell >/dev/null 2>&1; then
+    log "Restarting Omarchy shell to apply lock screen changes immediately..."
+    target_user="${SUDO_USER:-$USER}"
+    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+      su - "$target_user" -c "omarchy-restart-shell" || true
+    else
+      omarchy-restart-shell || true
+    fi
+    ok "Omarchy shell refreshed."
   fi
 fi
 
 echo
 if [[ $DRY_RUN -eq 1 ]]; then
-  ok "Dry run complete. No files were changed."
+  ok "Dry run complete. No files were modified."
   exit 0
 fi
 
-ok "Done."
+ok "Howdy PAM setup complete!"
+
 cat <<'EOF'
 
 ──────────────────────────────────────────────────────────────────────────
-NEXT STEPS — DO NOT SKIP TESTING
+HOW TO TEST:
 ──────────────────────────────────────────────────────────────────────────
-1. Open a SECOND terminal (keep this one open as a fallback) and run:
+1. Sudo Face Auth:
+   Open a terminal and run:
      sudo -k && sudo whoami
-   Confirm it either face-matches you or cleanly falls back to a password
-   prompt. If it hangs or errors with no fallback, run:
-     sudo ./howdy-pam-setup.sh --undo
+   Confirm Howdy matches your face and outputs 'root'.
 
-2. Also test:
-     su - "$USER"
+2. Lock Screen Face Auth:
+   Lock your screen (e.g. Super + Ctrl + L).
+   Simply press [Enter] without typing any password.
+   The prompt will display 'Checking…', Howdy's IR camera will light up,
+   scan your face, and unlock the desktop!
 
-3. Lock your screen (Meta+L) and confirm Howdy attempts a face scan there.
-
-4. Test a polkit prompt (e.g. open a GUI app that needs admin rights, like
-   a package manager) and confirm Howdy triggers there too.
+3. Password Fallback:
+   If your face is not recognized or in dark environments, you can still
+   type your password and press [Enter] normally.
 
 ──────────────────────────────────────────────────────────────────────────
-NOTE ON KWALLET / KEYRING
-──────────────────────────────────────────────────────────────────────────
-This script intentionally does NOT touch kwallet. Kwallet derives its
-encryption key from your login password (via pam_kwallet5), not a
-pass/fail auth check — so wiring Howdy into it directly isn't possible
-the same way. If you log into plasmalogin with your password as usual,
-kwallet auto-unlocks normally; Howdy only replaces the *face* step for
-sudo/su/lock-screen/polkit, not the password kwallet needs.
-
-To restore your previous PAM config at any time:
-     sudo ./howdy-pam-setup.sh --undo
+To restore your original configuration at any time, run:
+  sudo ./howdy-pam-setup.sh --undo
 ──────────────────────────────────────────────────────────────────────────
 EOF

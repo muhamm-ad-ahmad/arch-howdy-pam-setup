@@ -1,70 +1,62 @@
-# arch-howdy-pam-setup
+# arch-howdy-pam-setup (with Omarchy support)
 
-Automated, idempotent script to wire [Howdy](https://github.com/boltgolt/howdy) (webcam face recognition) into PAM authentication on Arch-based Linux systems.
+Automated PAM configuration script to set up [Howdy](https://github.com/boltgolt/howdy) / [howdy-next](https://github.com/Howdy-Next/howdy-next) facial recognition authentication on **Arch Linux**, **CachyOS**, and **Omarchy**.
 
-Tested on **CachyOS + KDE Plasma**, should work on any Arch-based distro (Manjaro, EndeavourOS, vanilla Arch).
+## Features
 
-## What it does
+- **Automated Module Detection**: Automatically discovers `pam_howdy.so` under `/usr/lib/`.
+- **Sudo & System Auth**: Configures `/etc/pam.d/sudo` and `/etc/pam.d/system-auth` for terminal commands, polkit prompts, and standard display managers.
+- **Omarchy Lockscreen Support**:
+  - Automatically detects Omarchy desktop.
+  - Configures Omarchy's dedicated PAM service (`/etc/pam.d/omarchy-lock-password`).
+  - Patches the generator template (`/usr/bin/omarchy-apply-lock`) to survive updates.
+  - Patches the Quickshell lock UI (`LockView.qml` & `Service.qml`) so you can **simply press <kbd>Enter</kbd>** to trigger facial recognition without typing a password!
+  - Restarts the Omarchy shell to apply changes immediately.
+- **Safe & Idempotent**: Safe to run multiple times without duplicating lines. Creates timestamped `.bak` files before modifying anything.
+- **Full Undo Support**: Easily rollback changes with `--undo`.
 
-- Locates `pam_howdy.so` automatically (no hardcoded paths)
-- Backs up every PAM file it touches before editing (timestamped, restorable)
-- Adds Howdy face auth to:
-  - `sudo`
-  - `system-auth` (which also covers `su`, `login`, KDE's lock screen via `kde` → `system-local-login` → `system-login`, and `polkit-1` — on most Arch/CachyOS setups where those files just `include system-auth`)
-- Safe to re-run — skips files that already have the Howdy line instead of duplicating it
-- Includes a dry-run mode to preview changes before touching anything
-- Includes an undo command to restore the previous PAM config
+---
 
-**Not covered:** KWallet/GNOME Keyring. These derive their encryption key from your actual login password, not a pass/fail auth check, so they can't be wired through Howdy the same way. Keep logging in with your password normally and they'll keep unlocking automatically.
+## Prerequisites
 
-## Requirements
+Make sure `howdy` or `howdy-next` is installed and you have enrolled your face:
 
-- Howdy (howdy-next or similar) already installed and your face already enrolled (`sudo howdy add`)
-- Arch-based distro with the standard `system-auth` / `system-login` PAM layout
+```bash
+# Example with howdy-next:
+yay -S howdy-next
+sudo howdy add
+sudo howdy test
+```
+
+---
 
 ## Usage
 
-### Download and run
-
+### 1. Preview changes (Dry Run)
 ```bash
-curl -fsSL https://raw.githubusercontent.com/muhamm-ad-ahmad/arch-howdy-pam-setup/main/howdy-pam-setup.sh -o howdy-pam-setup.sh
-chmod +x howdy-pam-setup.sh
-
-# Preview changes first
 sudo ./howdy-pam-setup.sh --dry-run
+```
 
-# Apply
+### 2. Apply configuration
+```bash
 sudo ./howdy-pam-setup.sh
 ```
 
-### Or run directly without saving the file
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/muhamm-ad-ahmad/arch-howdy-pam-setup/main/howdy-pam-setup.sh | sudo bash
-```
-
-### Undo
-
+### 3. Revert changes (Undo)
 ```bash
 sudo ./howdy-pam-setup.sh --undo
 ```
 
-Restores the most recent backup of each modified file.
+---
 
-## After running — test before you rely on it
+## How to Test
 
-Open a **second terminal** and keep your first one open as a fallback, then:
+1. **Test Sudo**:
+   ```bash
+   sudo -k && sudo whoami
+   ```
+   Confirm Howdy scans your face and outputs `root`.
 
-```bash
-sudo -k && sudo whoami
-su - "$USER"
-```
-
-Then lock your screen (`Meta+L`) and confirm Howdy attempts a face scan. Also test a polkit prompt (e.g. opening a GUI package manager).
-
-If anything breaks, run the `--undo` command above, or restore manually from the `.bak.<timestamp>` files left next to each edited PAM file in `/etc/pam.d/`.
-
-## Safety notes
-
-- Howdy is always added as `auth sufficient`, never `required` — so a failed or unavailable face scan always falls back to your password. It should never lock you out on its own.
-- Still, always keep a second terminal session (or a live USB) available the first time you run this, in case something in your specific PAM layout differs from the standard template.
+2. **Test Lock Screen**:
+   Lock your desktop (<kbd>Super</kbd> + <kbd>Ctrl</kbd> + <kbd>L</kbd>).
+   **Just press <kbd>Enter</kbd>** without typing anything. The prompt will show `Checking…`, the IR camera will scan your face, and the screen will unlock!
