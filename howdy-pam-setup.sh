@@ -3,13 +3,14 @@
 # howdy-pam-setup.sh — Automated Howdy PAM setup for Arch Linux & Omarchy
 #
 # Works on:
-#   - Arch Linux / CachyOS (standard sudo + system-auth)
-#   - Omarchy (sudo + system-auth + Quickshell lockscreen with "press Enter to scan")
+#   - Arch Linux / CachyOS (sudo + system-auth + sddm)
+#   - Omarchy (sudo + system-auth + SDDM greeter + Quickshell lockscreen)
 #
 # Features:
 #   - Auto-detects pam_howdy.so location
-#   - Detects Omarchy desktop and configures its custom Quickshell lock screen
-#   - Patches Omarchy lock screen to trigger face scan when pressing Enter
+#   - Configures sudo and system-auth
+#   - Configures SDDM greeter (both /etc/pam.d/sddm and auto-face-scan on load)
+#   - Configures Omarchy Quickshell lock screen ("press Enter to scan")
 #   - Fully idempotent (safe to re-run anytime)
 #   - Creates timestamped backups of all modified files
 #   - Full --undo and --dry-run support
@@ -58,20 +59,26 @@ TS="$(date +%Y%m%d-%H%M%S)"
 PAM_DIR="/etc/pam.d"
 SUDO_FILE="$PAM_DIR/sudo"
 SYSAUTH_FILE="$PAM_DIR/system-auth"
+SDDM_PAM_FILE="$PAM_DIR/sddm"
 
 # Omarchy specific paths
 OMARCHY_PAM_FILE="$PAM_DIR/omarchy-lock-password"
 OMARCHY_APPLY_LOCK="/usr/bin/omarchy-apply-lock"
 LOCKVIEW_QML="/usr/share/omarchy/shell/plugins/lock/LockView.qml"
 SERVICE_QML="/usr/share/omarchy/shell/plugins/lock/Service.qml"
+SDDM_THEME_QML="/usr/share/sddm/themes/omarchy/Main.qml"
+SDDM_DEFAULT_QML="/usr/share/omarchy/default/sddm/omarchy/Main.qml"
 
 ALL_MANAGED_FILES=(
   "$SUDO_FILE"
   "$SYSAUTH_FILE"
+  "$SDDM_PAM_FILE"
   "$OMARCHY_PAM_FILE"
   "$OMARCHY_APPLY_LOCK"
   "$LOCKVIEW_QML"
   "$SERVICE_QML"
+  "$SDDM_THEME_QML"
+  "$SDDM_DEFAULT_QML"
 )
 
 # Terminal formatting
@@ -114,7 +121,6 @@ if [[ $UNDO -eq 1 ]]; then
     # If Omarchy shell is running, reload it
     if command -v omarchy-restart-shell >/dev/null 2>&1; then
       log "Restarting Omarchy shell to reload restored files..."
-      # Run as the actual user if running through sudo
       target_user="${SUDO_USER:-$USER}"
       if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
         su - "$target_user" -c "omarchy-restart-shell" || true
@@ -180,7 +186,25 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Omarchy Lock Screen Configuration
+# 4. Configure /etc/pam.d/sddm (Display Manager Login Screen)
+# ---------------------------------------------------------------------------
+if [[ -f "$SDDM_PAM_FILE" ]]; then
+  log "Checking $SDDM_PAM_FILE..."
+  if grep -q "pam_howdy.so" "$SDDM_PAM_FILE"; then
+    ok "$SDDM_PAM_FILE already configured with Howdy, skipping"
+  else
+    if [[ $DRY_RUN -eq 1 ]]; then
+      log "[dry-run] Would prepend Howdy to $SDDM_PAM_FILE"
+    else
+      backup_file "$SDDM_PAM_FILE"
+      sed -i "1a ${HOWDY_LINE}" "$SDDM_PAM_FILE"
+      ok "Configured $SDDM_PAM_FILE"
+    fi
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Omarchy Desktop Environment Configuration
 # ---------------------------------------------------------------------------
 is_omarchy=0
 if [[ -f "$OMARCHY_PAM_FILE" || -d "/usr/share/omarchy" ]]; then
@@ -190,7 +214,7 @@ fi
 if [[ $is_omarchy -eq 1 ]]; then
   log "Omarchy desktop environment detected!"
 
-  # 4a. /etc/pam.d/omarchy-lock-password
+  # 5a. /etc/pam.d/omarchy-lock-password
   log "Checking $OMARCHY_PAM_FILE..."
   if [[ ! -f "$OMARCHY_PAM_FILE" ]]; then
     warn "$OMARCHY_PAM_FILE not found"
@@ -215,7 +239,7 @@ if [[ $is_omarchy -eq 1 ]]; then
     fi
   fi
 
-  # 4b. /usr/bin/omarchy-apply-lock (to survive future lock generator runs)
+  # 5b. /usr/bin/omarchy-apply-lock (to survive future lock generator runs)
   if [[ -f "$OMARCHY_APPLY_LOCK" ]]; then
     log "Checking $OMARCHY_APPLY_LOCK template..."
     if grep -q "pam_howdy.so" "$OMARCHY_APPLY_LOCK"; then
@@ -231,7 +255,7 @@ if [[ $is_omarchy -eq 1 ]]; then
     fi
   fi
 
-  # 4c. Patch LockView.qml to allow submitting empty password by pressing Enter
+  # 5c. Patch LockView.qml to allow submitting empty password by pressing Enter
   if [[ -f "$LOCKVIEW_QML" ]]; then
     log "Checking $LOCKVIEW_QML..."
     if ! grep -q "submitted.length > 0" "$LOCKVIEW_QML"; then
@@ -247,7 +271,7 @@ if [[ $is_omarchy -eq 1 ]]; then
     fi
   fi
 
-  # 4d. Patch Service.qml to permit empty password for PAM face recognition
+  # 5d. Patch Service.qml to permit empty password for PAM face recognition
   if [[ -f "$SERVICE_QML" ]]; then
     log "Checking $SERVICE_QML..."
     if ! grep -q "password.length === 0" "$SERVICE_QML"; then
@@ -263,7 +287,33 @@ if [[ $is_omarchy -eq 1 ]]; then
     fi
   fi
 
-  # 4e. Reload Omarchy shell if running
+  # 5e. Patch SDDM Omarchy Theme Main.qml for auto face scan on load
+  for qml_path in "$SDDM_THEME_QML" "$SDDM_DEFAULT_QML"; do
+    if [[ -f "$qml_path" ]]; then
+      log "Checking $(basename "$(dirname "$qml_path")")/Main.qml..."
+      if grep -q "autoFaceScanTimer" "$qml_path"; then
+        ok "$qml_path already configured for auto face scan, skipping"
+      else
+        if [[ $DRY_RUN -eq 1 ]]; then
+          log "[dry-run] Would patch $qml_path with auto face scan timer and status"
+        else
+          backup_file "$qml_path"
+          # Insert property and timer after sessionIndex block
+          sed -i '/property int sessionIndex:/i \  property bool authenticating: false\n\n  Timer {\n    id: autoFaceScanTimer\n    interval: 400\n    running: true\n    repeat: false\n    onTriggered: {\n      if (root.currentUser && root.currentUser.length > 0 && password.text.length === 0) {\n        root.authenticating = true\n        sddm.login(root.currentUser, "", root.sessionIndex)\n      }\n    }\n  }\n' "$qml_path"
+          # Reset authenticating state in Connections
+          sed -i '/function onLoginFailed() {/a \      root.authenticating = false' "$qml_path"
+          sed -i '/function onLoginSucceeded() {/a \      root.authenticating = false' "$qml_path"
+          # Set authenticating state on Enter press
+          sed -i '/if (event.key === Qt.Key_Return/a \              root.authenticating = true' "$qml_path"
+          # Add "Scanning face…" text indicator inside Item
+          sed -i '/id: entry/a \\n        Text {\n          anchors.centerIn: parent\n          text: root.authenticating ? "Scanning face…" : ""\n          color: "#7aa2f7"\n          font.family: "JetBrainsMono Nerd Font"\n          font.pixelSize: 14\n          visible: password.text.length === 0 && root.authenticating\n        }' "$qml_path"
+          ok "Patched $qml_path (SDDM auto-scan on greeter load)"
+        fi
+      fi
+    fi
+  done
+
+  # 5f. Reload Omarchy shell if running
   if [[ $DRY_RUN -eq 0 ]] && command -v omarchy-restart-shell >/dev/null 2>&1; then
     log "Restarting Omarchy shell to apply lock screen changes immediately..."
     target_user="${SUDO_USER:-$USER}"
@@ -290,19 +340,19 @@ cat <<'EOF'
 HOW TO TEST:
 ──────────────────────────────────────────────────────────────────────────
 1. Sudo Face Auth:
-   Open a terminal and run:
-     sudo -k && sudo whoami
+   Run: sudo -k && sudo whoami
    Confirm Howdy matches your face and outputs 'root'.
 
 2. Lock Screen Face Auth:
-   Lock your screen (e.g. Super + Ctrl + L).
+   Lock your screen (Super + Ctrl + L).
    Simply press [Enter] without typing any password.
-   The prompt will display 'Checking…', Howdy's IR camera will light up,
-   scan your face, and unlock the desktop!
+   Howdy will scan your face and unlock immediately!
 
-3. Password Fallback:
-   If your face is not recognized or in dark environments, you can still
-   type your password and press [Enter] normally.
+3. Greeter / Login Screen Face Auth:
+   When you boot up or log out to the SDDM greeter:
+   Howdy will automatically turn on the camera and scan your face!
+   If needed, you can also press [Enter] to re-trigger the scan, or
+   type your password normally.
 
 ──────────────────────────────────────────────────────────────────────────
 To restore your original configuration at any time, run:
