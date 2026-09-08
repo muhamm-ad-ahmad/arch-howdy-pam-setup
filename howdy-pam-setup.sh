@@ -258,16 +258,37 @@ if [[ $is_omarchy -eq 1 ]]; then
   # 5c. Patch LockView.qml to allow submitting empty password by pressing Enter
   if [[ -f "$LOCKVIEW_QML" ]]; then
     log "Checking $LOCKVIEW_QML..."
-    if ! grep -q "submitted.length > 0" "$LOCKVIEW_QML"; then
-      ok "$LOCKVIEW_QML already allows empty submission, skipping"
-    else
+    patched_lockview=0
+    if grep -q "submitted.length > 0" "$LOCKVIEW_QML"; then
       if [[ $DRY_RUN -eq 1 ]]; then
         log "[dry-run] Would patch $LOCKVIEW_QML to submit on empty Enter"
       else
         backup_file "$LOCKVIEW_QML"
         sed -i 's/if (submitted.length > 0) root.submitPassword(submitted)/root.submitPassword(submitted)/' "$LOCKVIEW_QML"
-        ok "Patched $LOCKVIEW_QML (Enter submits on empty field)"
+        patched_lockview=1
       fi
+    fi
+    if ! grep -q "Qt.Key_Return" "$LOCKVIEW_QML"; then
+      if [[ $DRY_RUN -eq 1 ]]; then
+        log "[dry-run] Would patch $LOCKVIEW_QML Keys.onPressed to handle Return/Enter directly"
+      else
+        backup_file "$LOCKVIEW_QML"
+        python3 -c '
+with open("'"$LOCKVIEW_QML"'", "r") as f:
+    c = f.read()
+target = "Keys.onPressed: function(event) {\n          root.wakeRequested()"
+replacement = "Keys.onPressed: function(event) {\n          root.wakeRequested()\n          if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {\n            var submitted = root.passwordText\n            root.passwordTextEdited(\"\")\n            root.submitPassword(submitted)\n            event.accepted = true\n            return\n          }"
+if target in c:
+    with open("'"$LOCKVIEW_QML"'", "w") as f:
+        f.write(c.replace(target, replacement, 1))
+'
+        patched_lockview=1
+      fi
+    fi
+    if [[ $patched_lockview -eq 1 ]]; then
+      ok "Patched $LOCKVIEW_QML (Enter key triggers face scan immediately)"
+    else
+      ok "$LOCKVIEW_QML already configured for empty Enter submission, skipping"
     fi
   fi
 
